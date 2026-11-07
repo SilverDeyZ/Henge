@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from macho_entitlements import read_entitlements
 
 ipa, manifest, husk_rev = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -38,9 +39,7 @@ with zipfile.ZipFile(ipa) as archive:
         subprocess.run(["ditto", "-x", "-k", str(ipa), directory], check=True)
         unpacked = Path(directory) / app
         subprocess.run(["codesign", "--verify", "--deep", "--strict", str(unpacked)], check=True)
-        signature = subprocess.run(["codesign", "-d", "--entitlements", "-", str(unpacked)],
-                                   capture_output=True, check=True)
-        entitlements = plistlib.loads(signature.stdout)
+        entitlements = read_entitlements((unpacked / "Henge").read_bytes())
         for key in ("get-task-allow", "com.apple.developer.kernel.increased-memory-limit",
                     "com.apple.developer.kernel.extended-virtual-addressing"):
             if entitlements.get(key) is not True:
