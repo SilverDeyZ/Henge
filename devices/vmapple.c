@@ -1,5 +1,6 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
+#include "ram_diag.h"
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -116,30 +118,68 @@ static void gic_msi_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
                            (unsigned long long)v, size);
 }
 
-/* Guest RAM the memory limit does not count: asking the kernel to leave these
-   pages out of this process's footprint. It allows that once a debugger has
-   been attached, which is how an iOS app gets to use JIT at all. Returns NULL
-   if it is refused. In pieces, as one memory entry has a size limit. */
+/* Ask the kernel to leave guest RAM out of the process's footprint. Permission
+   is kernel/signing dependent; live JIT alone does not prove it is allowed.
+   Returns NULL if refused. In pieces, as one memory entry has a size limit. */
 extern kern_return_t mach_memory_entry_ownership(mach_port_t entry, task_t owner, int ledger_tag, int ledger_flags);
+
+static void log_ram_limits(void) {
+    const int resources[] = {RLIMIT_AS, RLIMIT_DATA, RLIMIT_FSIZE};
+    const char *names[] = {"address-space", "data", "file-size"};
+    for (unsigned i = 0; i < sizeof resources / sizeof resources[0]; i++) {
+        struct rlimit limit;
+        int rc = getrlimit(resources[i], &limit);
+        int error = rc < 0 ? errno : 0;
+        if (rc == 0)
+            fprintf(stderr, "hengevm: ram[limits] %s soft=%llu hard=%llu infinity=%llu\n", names[i],
+                    (unsigned long long)limit.rlim_cur, (unsigned long long)limit.rlim_max,
+                    (unsigned long long)RLIM_INFINITY);
+        else
+            fprintf(stderr, "hengevm: ram[limits] %s rc=%d errno=%d (%s)\n", names[i], rc, error, strerror(error));
+    }
+}
 
 static uint8_t *alloc_no_footprint(uint64_t size) {
     enum { CHUNK = 128u << 20, MAP_MEM_LEDGER_TAGGED_ = 0x002000, MAP_MEM_NAMED_CREATE_ = 0x020000, LEDGER_TAG_DEFAULT = 1, LEDGER_NO_FOOTPRINT = 1 };
     vm_address_t base = 0;
-    if (vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return NULL;
+    HvRamTrace trace = hv_ram_trace_begin("ledger", "vm_allocate", size, 0, VM_FLAGS_ANYWHERE,
+                                         VM_PROT_READ | VM_PROT_WRITE, NULL);
+    kern_return_t kr = vm_allocate(mach_task_self(), &base, size, VM_FLAGS_ANYWHERE);
+    hv_ram_trace_mach(&trace, kr, (void *)base);
+    if (kr != KERN_SUCCESS) return NULL;
     for (uint64_t off = 0; off < size; off += CHUNK) {
         uint64_t len = size - off < CHUNK ? size - off : CHUNK;
         memory_object_size_t got = len;
         mach_port_t entry = MACH_PORT_NULL;
-        kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &got, 0, MAP_MEM_NAMED_CREATE_ | MAP_MEM_LEDGER_TAGGED_ | VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
-        if (kr == KERN_SUCCESS) kr = mach_memory_entry_ownership(entry, TASK_NULL, LEDGER_TAG_DEFAULT, LEDGER_NO_FOOTPRINT);
+        int permission = MAP_MEM_NAMED_CREATE_ | MAP_MEM_LEDGER_TAGGED_ | VM_PROT_READ | VM_PROT_WRITE;
+        trace = hv_ram_trace_begin("ledger", "mach_make_memory_entry_64", len, off, permission,
+                                   VM_PROT_READ | VM_PROT_WRITE, NULL);
+        kr = mach_make_memory_entry_64(mach_task_self(), &got, 0, permission, &entry, MACH_PORT_NULL);
+        hv_ram_trace_mach(&trace, kr, NULL);
+        fprintf(stderr, "hengevm: ram[ledger] entry_bytes=%llu requested_bytes=%llu offset=%llu\n",
+                (unsigned long long)got, (unsigned long long)len, (unsigned long long)off);
+        if (kr == KERN_SUCCESS) {
+            trace = hv_ram_trace_begin("ledger", "mach_memory_entry_ownership", len, off,
+                                       LEDGER_NO_FOOTPRINT, 0, NULL);
+            kr = mach_memory_entry_ownership(entry, TASK_NULL, LEDGER_TAG_DEFAULT, LEDGER_NO_FOOTPRINT);
+            hv_ram_trace_mach(&trace, kr, NULL);
+        }
         if (kr == KERN_SUCCESS) {
             vm_address_t to = base + off;
+            trace = hv_ram_trace_begin("ledger", "vm_map", len, off, VM_FLAGS_OVERWRITE,
+                                       VM_PROT_READ | VM_PROT_WRITE, (void *)to);
             kr = vm_map(mach_task_self(), &to, len, 0, VM_FLAGS_OVERWRITE, entry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+            hv_ram_trace_mach(&trace, kr, (void *)to);
         }
-        if (entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entry);
+        if (entry != MACH_PORT_NULL) {
+            trace = hv_ram_trace_begin("ledger", "mach_port_deallocate", len, off, 0, 0, NULL);
+            kern_return_t cleanup = mach_port_deallocate(mach_task_self(), entry);
+            hv_ram_trace_mach(&trace, cleanup, NULL);
+        }
         if (kr != KERN_SUCCESS) {
-            fprintf(stderr, "hengevm: guest RAM outside the footprint refused: %s\n", mach_error_string(kr));
-            vm_deallocate(mach_task_self(), base, size);
+            trace = hv_ram_trace_begin("ledger", "vm_deallocate", size, 0, 0, 0, (void *)base);
+            kern_return_t cleanup = vm_deallocate(mach_task_self(), base, size);
+            hv_ram_trace_mach(&trace, cleanup, (void *)base);
             return NULL;
         }
     }
@@ -207,21 +247,45 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
        drop by itself, so the guest can have more RAM than the app may hold.
        The file is unlinked at once and goes away with the process. */
     const char *ram_file = getenv("HV_RAM_FILE");
+    log_ram_limits();
+    fprintf(stderr, "hengevm: ram[select] bytes=%llu page_bytes=%ld file_configured=%d ledger_disabled=%d prefault_disabled=%d\n",
+            (unsigned long long)ram_size, sysconf(_SC_PAGESIZE), ram_file && *ram_file,
+            getenv("HV_RAM_NO_LEDGER") != NULL, getenv("HV_RAM_NO_PREFAULT") != NULL);
     b->ram = MAP_FAILED;
     if (!getenv("HV_RAM_NO_LEDGER")) {
+        fprintf(stderr, "hengevm: ram[select] trying=ledger\n");
         uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
         if (free_of_footprint) b->ram = free_of_footprint;
+        else fprintf(stderr, "hengevm: ram[select] ledger unavailable; considering fallbacks\n");
     }
+    HvRamTrace trace;
     if (b->ram == MAP_FAILED && ram_file && *ram_file) {
+        fprintf(stderr, "hengevm: ram[select] trying=file\n");
+        trace = hv_ram_trace_begin("file", "open", ram_size, 0, O_RDWR | O_CREAT | O_TRUNC, 0, NULL);
         int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        int error = fd < 0 ? errno : 0;
+        hv_ram_trace_posix(&trace, fd, error, NULL);
         if (fd >= 0) {
-            unlink(ram_file);
-            if (ftruncate(fd, (off_t)ram_size) == 0)
+            trace = hv_ram_trace_begin("file", "unlink", ram_size, 0, 0, 0, NULL);
+            int rc = unlink(ram_file);
+            error = rc < 0 ? errno : 0;
+            hv_ram_trace_posix(&trace, rc, error, NULL);
+            trace = hv_ram_trace_begin("file", "ftruncate", ram_size, 0, 0, 0, NULL);
+            rc = ftruncate(fd, (off_t)ram_size);
+            error = rc < 0 ? errno : 0;
+            hv_ram_trace_posix(&trace, rc, error, NULL);
+            if (rc == 0) {
+                trace = hv_ram_trace_begin("file", "mmap", ram_size, 0, MAP_SHARED, PROT_READ | PROT_WRITE, NULL);
                 b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            close(fd);
+                error = b->ram == MAP_FAILED ? errno : 0;
+                hv_ram_trace_posix(&trace, b->ram == MAP_FAILED ? -1 : 0, error, b->ram);
+            }
+            trace = hv_ram_trace_begin("file", "close", ram_size, 0, 0, 0, NULL);
+            rc = close(fd);
+            error = rc < 0 ? errno : 0;
+            hv_ram_trace_posix(&trace, rc, error, NULL);
         }
-        if (b->ram == MAP_FAILED) fprintf(stderr, "hengevm: guest RAM file %s failed: %s; using anonymous memory\n", ram_file, strerror(errno));
-        else {
+        if (b->ram != MAP_FAILED) {
             fprintf(stderr, "hengevm: guest RAM (%llu MB) is backed by a file\n", (unsigned long long)(ram_size >> 20));
             if (!getenv("HV_RAM_NO_PREFAULT")) {
                 struct PrefaultArgs *a = malloc(sizeof *a);
@@ -232,9 +296,22 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             }
         }
     }
-    if (b->ram == MAP_FAILED) b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (b->ram == MAP_FAILED) return -1;
+    if (b->ram == MAP_FAILED) {
+        fprintf(stderr, "hengevm: ram[select] trying=anonymous\n");
+        trace = hv_ram_trace_begin("anonymous", "mmap", ram_size, 0, MAP_PRIVATE | MAP_ANON, PROT_READ | PROT_WRITE, NULL);
+        b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        int error = b->ram == MAP_FAILED ? errno : 0;
+        hv_ram_trace_posix(&trace, b->ram == MAP_FAILED ? -1 : 0, error, b->ram);
+    }
+    if (b->ram == MAP_FAILED) {
+        fprintf(stderr, "hengevm: ram[select] all guest RAM strategies failed\n");
+        return -1;
+    }
+    fprintf(stderr, "hengevm: ram[select] guest RAM mapped; ROM allocation next (memory use not yet validated)\n");
+    trace = hv_ram_trace_begin("rom", "mmap", ROM_SIZE, 0, MAP_PRIVATE | MAP_ANON, PROT_READ | PROT_WRITE, NULL);
     b->rom = mmap(NULL, ROM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    int error = b->rom == MAP_FAILED ? errno : 0;
+    hv_ram_trace_posix(&trace, b->rom == MAP_FAILED ? -1 : 0, error, b->rom);
     if (b->rom == MAP_FAILED) return -1;
     /* QEMU maps the firmware as RAM, and so do we. */
     hv_machine_add_ram(m, VMAPPLE_FIRMWARE, ROM_SIZE, b->rom, 0);

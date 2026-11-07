@@ -1,5 +1,6 @@
 #include "vm.h"
 #include "pvg_lite.h"
+#include "ram_diag.h"
 
 #include <TargetConditionals.h>
 #include <pthread.h>
@@ -217,7 +218,11 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
         return fail(err, errlen, "Cannot open the auxiliary storage.");
     size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)768 << 20;
+    fprintf(stderr, "hengevm: ram[engine] jit_bytes=%zu rx=%p rw=%p guest_bytes=%llu\n",
+            jit, c->jit_rx, c->jit_rw, (unsigned long long)((c->ram_mb ? c->ram_mb : 2048) << 20));
+    HvRamTrace trace = hv_ram_trace_begin("engine", "machine_init", jit, 0, 0, 0, c->jit_rx);
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
+    hv_ram_trace_emit(&trace, "after", m.jit.base, "result", r, 0);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;

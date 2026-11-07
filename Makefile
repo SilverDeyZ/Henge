@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_ram_diagnostics
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -158,3 +158,11 @@ $(B)/install.o: host/install.c host/*.h devices/*.h | $(B)
 	$(CC) $(CFLAGS) $(RESTORE_CFLAGS) -c $< -o $@
 restore-objs: $(RESTORE_OBJ)
 .PHONY: restore-objs
+
+# Diagnostics: inject snapshot/logging failures without allocating guest RAM.
+$(B)/test_ram_diagnostics: tests/test_ram_diagnostics.c host/ram_diag.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+
+test-ram-diagnostics: $(B)/test_ram_diagnostics
+	$(B)/test_ram_diagnostics
+.PHONY: test-ram-diagnostics

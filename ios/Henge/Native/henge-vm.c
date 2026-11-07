@@ -3,6 +3,7 @@
 #include "net_slirp.h"
 #include <sys/mman.h>
 #include "henge-vm.h"
+#include "ram_diag.h"
 
 #include <os/proc.h>
 #include <stdio.h>
@@ -165,9 +166,16 @@ size_t henge_available_memory(void) { return os_proc_available_memory(); }
 
 uint64_t henge_largest_mapping_mb(void) {
     for (uint64_t mb = 16384; mb >= 1024; mb -= 512) {
+        HvRamTrace trace = hv_ram_trace_begin("probe", "mmap", mb << 20, 0,
+                                              MAP_PRIVATE | MAP_ANON, PROT_NONE, NULL);
         void *p = mmap(NULL, mb << 20, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        int error = p == MAP_FAILED ? errno : 0;
+        hv_ram_trace_posix(&trace, p == MAP_FAILED ? -1 : 0, error, p);
         if (p != MAP_FAILED) {
-            munmap(p, mb << 20);
+            trace = hv_ram_trace_begin("probe", "munmap", mb << 20, 0, 0, 0, p);
+            int rc = munmap(p, mb << 20);
+            error = rc < 0 ? errno : 0;
+            hv_ram_trace_posix(&trace, rc, error, p);
             return mb;
         }
     }

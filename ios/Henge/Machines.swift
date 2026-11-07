@@ -25,20 +25,25 @@ struct VirtualMac: Identifiable, Codable, Hashable {
     var aux: URL { directory.appendingPathComponent("auxiliary.bin") }
 }
 
-/// How much RAM a Mac gets. The engine first asks the kernel to leave it out of Henge's footprint,
-/// which is allowed once a debugger has attached (how JIT is turned on). If that is refused it uses
-/// a file beside the disk: iOS's memory limit does not count a mapped file's pages either.
+/// How much RAM a Mac gets. The engine tries ledger ownership, a file beside the disk,
+/// then anonymous memory. Permissions and accounting depend on the running system;
+/// live JIT and a successful address reservation do not guarantee guest RAM will work.
 enum GuestMemory {
     /// Points the engine at the file (it is unlinked as soon as it is open) and returns the size that fits.
     static func prepare(_ mac: VirtualMac) -> UInt64 {
+        HengeLog.logFootprint("before-guest-memory-prepare")
         let file = mac.directory.appendingPathComponent("ram.tmp")
-        setenv("HV_RAM_FILE", file.path, 1)
+        let fileResult = setenv("HV_RAM_FILE", file.path, 1)
+        let fileError = fileResult < 0 ? errno : 0
+        HengeLog.log("memory", "HV_RAM_FILE setenv rc=\(fileResult) errno=\(fileError)")
         let free = (try? mac.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
         let room = free > 0 ? UInt64(max(free - (2 << 30), 0)) >> 20 : UInt64.max
         let reach = henge_largest_mapping_mb()
         let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
         HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
+        HengeLog.log("memory", "disk available bytes=\(free) capacity known=\(free > 0), process available bytes=\(henge_available_memory()); probe is an uncommitted anonymous reservation")
+        HengeLog.logFootprint("after-guest-memory-prepare")
         return ram
     }
 }

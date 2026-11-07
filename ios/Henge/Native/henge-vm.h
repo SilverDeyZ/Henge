@@ -63,8 +63,9 @@ void henge_vm_set_display_layer(void *layer);
 uint64_t henge_vm_gpu_frames(void);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
 
-/* The largest single mapping the address space takes right now, in MB (the
-   increased virtual addressing entitlement raises it). */
+/* Largest tested anonymous PROT_NONE reservation right now, in MiB, at 512 MiB
+   steps up to 16384. Released immediately; not a guarantee for writable/file
+   RAM later, after the engine has allocated its tables. */
 uint64_t henge_largest_mapping_mb(void);
 /* Bytes this process may still allocate before jetsam (os_proc_available_memory). */
 size_t henge_available_memory(void);

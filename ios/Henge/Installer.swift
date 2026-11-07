@@ -193,8 +193,10 @@ final class Installer: NSObject, ObservableObject {
         let work = mac.directory.appendingPathComponent("restore", isDirectory: true)
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         var buffer = [CChar](repeating: 0, count: 256)
+        HengeLog.log("memory", "installer passing \(ram) MiB to henge_vm_install (requested \(mac.ramMB))")
         let rc = henge_vm_install(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, ipsw.path, work.path, ram, Int32(cpus),
                                   &buffer, buffer.count)
+        HengeLog.log("memory", "henge_vm_install returned rc=\(rc)")
         if rc != 0 { throw message(String(cString: buffer)) }
         while true {
             try await Task.sleep(nanoseconds: 1_000_000_000)
