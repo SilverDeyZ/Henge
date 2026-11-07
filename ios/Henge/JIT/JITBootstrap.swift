@@ -44,22 +44,13 @@ enum JITBootstrap {
                          + "return 0 instead of killing the process")
     }
 
-    /// Size QEMU will ask for. Must match tb-size in the phase 1 command line:
-    /// a smaller region here means QEMU allocates a second one, at a point where
-    /// StikDebug may be long gone.
-    // Back to 256 MiB. Raising this to 512 was one of three changes made at
-    // once in v15, and v15 was the first build to die inside qemu_init(). The
-    // guest RAM -- the other suspect -- has since been shown to map and write
-    // cleanly at 6144 MiB, which leaves this. The region itself allocates and
-    // passes its selftest at 512; whatever objects is further in, where TCG
-    // carves the buffer into per-vCPU regions.
-    //
-    // 512 MiB since the native runtime runs Minecraft: its main library alone is a 354 MiB image that has to sit in this
-    // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which is handed the
-    // prewarmed region whenever it is at least what tb-size asks for.
-    /// The one region HengeVM's translator gets for the whole session (it flushes and starts over when full,
-    /// never asks for more). 1 GB takes about 1.5 s to prepare, and a first boot through Setup makes that much code; a full flush drops all of it.
-    static let jitBytes = 1024 * 1024 * 1024
+    /// Controlled iPad address-space experiment: the 1 GiB cache passed its
+    /// self-test, but engine metadata then reserved another 1,723 MiB and the
+    /// subsequent 4 GiB guest reservation failed with KERN_NO_SPACE. Halve the
+    /// cache and its size-dependent metadata while retaining the guest request.
+    /// HengeVM uses the returned mapping size and flushes when this cache fills;
+    /// the smaller cache may flush more often. Device validation is still needed.
+    static let jitBytes = 512 * 1024 * 1024
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it

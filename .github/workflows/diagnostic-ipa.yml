@@ -2,7 +2,7 @@ name: Diagnostic Henge IPA
 
 on:
   push:
-    branches: [diagnostics/ipados-memory-allocation-0.1]
+    branches: [diagnostics/ipados-memory-allocation-0.1, experiment/ipados-512m-jit]
   workflow_dispatch:
 
 permissions:
