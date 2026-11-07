@@ -1,0 +1,49 @@
+name: Diagnostic Henge IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnostic-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: diagnostics/ipados-memory-allocation-0.1
+      - name: Record diagnostic source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check Apple toolchain and native diagnostics
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          bash ios/scripts/check_memory.sh
+      - name: Build and package diagnostic IPA
+        run: bash ci/build-diagnostic-ipa.sh
+      - name: Upload IPA and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-diagnostics-${{ steps.source.outputs.sha }}
+          path: build/diagnostic-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-build-logs-${{ steps.source.outputs.sha }}
+          path: |
+            build/diagnostic-logs/
+            ios/build/DerivedData.buildlog
+          if-no-files-found: warn
+          retention-days: 14
